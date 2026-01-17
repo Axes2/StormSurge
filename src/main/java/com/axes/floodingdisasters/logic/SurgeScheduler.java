@@ -35,15 +35,11 @@ public class SurgeScheduler {
             if (chunk == null) continue;
             ChunkPos cp = chunk.getPos();
 
-            // PERFORMANCE & VISUALS:
-            // 1. Faster Rate: Modulo 20 (Every 1 second).
-            //    This minimizes the "lag time" between neighbor chunks updates, reducing the "square" look.
-            // 2. Noise Hash: (x * 31 + z * 17).
-            //    This randomizes the order so you don't see a "scanner line" moving across the map.
+            // PERFORMANCE: Staggered Updates with Noise
             if ((level.getGameTime() + (cp.x * 31L + cp.z * 17L)) % 20 != 0) continue;
 
-            // Cache Logic
             if (!COASTAL_CACHE.containsKey(cp)) {
+                // Now uses the updated CoastCache which detects inland floods!
                 boolean isCoastal = CoastCache.isCoastalChunk(level, cp);
                 COASTAL_CACHE.put(cp, isCoastal);
             }
@@ -68,13 +64,11 @@ public class SurgeScheduler {
         for (int x = 0; x < 16; x++) {
             for (int z = 0; z < 16; z++) {
 
-                // COLUMN OPTIMIZATION:
-                // We don't check the whole stack. We act on the surface and stop.
                 for (int y = 63; y <= ABSOLUTE_MAX_HEIGHT; y++) {
                     BlockPos pos = cp.getWorldPosition().offset(x, y, z);
                     BlockState currentState = level.getBlockState(pos);
 
-                    // --- RISING ---
+                    // --- MODE A: RISING ---
                     if (y <= localTargetY) {
                         if (level.isEmptyBlock(pos) || canSurgeDestroy(level, pos)) {
 
@@ -101,21 +95,23 @@ public class SurgeScheduler {
                                 if (z == 0) spreadNorth = true;
                                 if (z == 15) spreadSouth = true;
 
-                                // VISUAL SMOOTHING:
-                                // Break immediately after placing ONE block in this column.
-                                // This creates a "Slow Rise" effect (1 meter/sec) and saves huge CPU.
-                                break;
+                                break; // Visual Smoothing
                             }
                         }
                     }
-                    // --- RECEDING ---
+                    // --- MODE B: RECEDING ---
                     else {
-                        // For receding, we still want to clear everything above instantly.
-                        // But we can optimize: if we hit air, we know the rest above is air (usually).
                         if (currentState.is(ModBlocks.SURGE_WATER.get())) {
                             level.setBlock(pos, Blocks.AIR.defaultBlockState(), 2);
+
+                            // FIX: WAKE UP NEIGHBORS WHEN DRYING TOO!
+                            // This ensures the "Recession" spreads inland.
+                            if (x == 0) spreadWest = true;
+                            if (x == 15) spreadEast = true;
+                            if (z == 0) spreadNorth = true;
+                            if (z == 15) spreadSouth = true;
+
                         } else if (currentState.isAir()) {
-                            // Optimization: If we hit air, stop scanning up.
                             break;
                         }
                     }
@@ -129,7 +125,7 @@ public class SurgeScheduler {
         if (spreadSouth) activateChunk(cp.x, cp.z + 1);
     }
 
-    // --- Standard Helpers ---
+    // --- Helpers (No changes below) ---
     private static boolean hasWaterNeighbor(ServerLevel level, BlockPos pos) {
         return isWaterOrSurge(level, pos.north()) || isWaterOrSurge(level, pos.south()) ||
                 isWaterOrSurge(level, pos.east()) || isWaterOrSurge(level, pos.west());
