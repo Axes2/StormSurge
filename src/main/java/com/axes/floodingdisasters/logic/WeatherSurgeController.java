@@ -17,6 +17,9 @@ public class WeatherSurgeController {
     private static boolean weatherModFound = true;
     private static Method getWindMethod;
 
+    // Simple container for our data
+    public record FloodInfo(int targetY, float dirX, float dirZ) {}
+
     @SubscribeEvent
     public static void onLevelTick(LevelTickEvent.Post event) {
         if (weatherModFound && getWindMethod == null) {
@@ -29,31 +32,31 @@ public class WeatherSurgeController {
         }
     }
 
-    public static int getSurgeLevelAt(BlockPos pos, ServerLevel level) {
-        if (!weatherModFound || getWindMethod == null) return 62;
+    public static FloodInfo getFloodInfoAt(BlockPos pos, ServerLevel level) {
+        if (!weatherModFound || getWindMethod == null) return new FloodInfo(62, 1.0f, 0.0f);
 
         try {
-            // Check at High Altitude (Y=180) to avoid terrain drag
             Vec3 weatherBalloonPos = new Vec3(pos.getX(), 180.0, pos.getZ());
             Vec3 windVector = (Vec3) getWindMethod.invoke(null, weatherBalloonPos, level, false, false, false, true);
+
             double windSpeed = windVector.length();
 
-            // --- BALANCED MATH ---
-            // Goal: 250mph = +8 Blocks. Weak storms = 0 Blocks.
-            // Threshold: 60mph. Divisor: 24.
+            // Normalize direction for the wave calculation
+            Vec3 dir = windVector.normalize();
+            // If calm, default to a gentle diagonal drift
+            if (windSpeed < 1.0) dir = new Vec3(0.7, 0, 0.7);
 
-            if (windSpeed < 60.0) {
-                return 62;
-            } else {
+            int targetY = 62;
+            if (windSpeed >= 60.0) {
                 double rise = (windSpeed - 60.0) / 24.0;
-                int target = 62 + (int) rise;
-
-                // Hard Cap at 75 (Sea Level + 13) to prevent world-ending floods
-                return Math.min(target, 75);
+                targetY = 62 + (int) rise;
+                targetY = Math.min(targetY, 75);
             }
 
+            return new FloodInfo(targetY, (float)dir.x, (float)dir.z);
+
         } catch (Exception e) {
-            return 62;
+            return new FloodInfo(62, 1.0f, 0.0f);
         }
     }
 }

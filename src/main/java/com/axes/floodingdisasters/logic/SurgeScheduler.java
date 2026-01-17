@@ -24,6 +24,11 @@ public class SurgeScheduler {
     private static final int ABSOLUTE_MAX_HEIGHT = 90;
     private static final Map<ChunkPos, Boolean> COASTAL_CACHE = new HashMap<>();
 
+    // Cache for wind data to avoid reflection lag
+    private static final Map<ChunkPos, CachedChunkData> SURGE_DATA_CACHE = new HashMap<>();
+
+    private record CachedChunkData(int targetY, float dirX, float dirZ, long lastUpdate) {}
+
     @SubscribeEvent
     public static void onLevelTick(LevelTickEvent.Post event) {
         if (event.getLevel().isClientSide) return;
@@ -35,15 +40,13 @@ public class SurgeScheduler {
             if (chunk == null) continue;
             ChunkPos cp = chunk.getPos();
 
-            // PERFORMANCE: Staggered Updates with Noise
-            if ((level.getGameTime() + (cp.x * 31L + cp.z * 17L)) % 20 != 0) continue;
-
+            // 1. Coast Check (Runs once mostly)
             if (!COASTAL_CACHE.containsKey(cp)) {
-                // Now uses the updated CoastCache which detects inland floods!
                 boolean isCoastal = CoastCache.isCoastalChunk(level, cp);
                 COASTAL_CACHE.put(cp, isCoastal);
             }
 
+            // 2. Run Surge Logic if Coastal
             if (COASTAL_CACHE.get(cp)) {
                 processChunkSurge(level, chunk);
             }
@@ -52,26 +55,58 @@ public class SurgeScheduler {
 
     private static void processChunkSurge(ServerLevel level, LevelChunk chunk) {
         ChunkPos cp = chunk.getPos();
+        long time = level.getGameTime();
 
-        BlockPos centerPos = cp.getWorldPosition().offset(8, 62, 8);
-        int localTargetY = WeatherSurgeController.getSurgeLevelAt(centerPos, level);
+        // --- DATA CACHING START ---
+        CachedChunkData data = SURGE_DATA_CACHE.get(cp);
+
+        // Refresh data every 20 ticks (1 second) to follow changing winds
+        if (data == null || (time - data.lastUpdate) > 20) {
+            BlockPos centerPos = cp.getWorldPosition().offset(8, 62, 8);
+            WeatherSurgeController.FloodInfo info = WeatherSurgeController.getFloodInfoAt(centerPos, level);
+            data = new CachedChunkData(info.targetY(), info.dirX(), info.dirZ(), time);
+            SURGE_DATA_CACHE.put(cp, data);
+        }
+        // --- DATA CACHING END ---
 
         boolean spreadNorth = false;
         boolean spreadSouth = false;
         boolean spreadWest = false;
         boolean spreadEast = false;
 
+        // "RATE": Controls how fast the wave moves.
+        // 8 = Update every 8 ticks (0.4s).
+        // Lower = Faster wave. Higher = Slower wave.
+        int updateRate = 8;
+
         for (int x = 0; x < 16; x++) {
             for (int z = 0; z < 16; z++) {
 
+                // --- DIRECTIONAL SWEEP LOGIC ---
+                // We project the block's position onto the wind direction vector.
+                // This creates a "Wave Front" value that moves across the chunk.
+                // We calculate global coordinates so the wave flows seamlessly between chunks.
+                long globalX = cp.x * 16L + x;
+                long globalZ = cp.z * 16L + z;
+
+                // The Offset determines "When" this block updates relative to time.
+                // Multiply by a small factor to stretch the wave if needed, but 1.0 works well for 1-block steps.
+                float waveOffset = globalX * data.dirX + globalZ * data.dirZ;
+
+                // If it's not this block's turn, skip it.
+                // This creates the "Scanning Line" effect moving in the wind direction.
+                if ((time - (int)waveOffset) % updateRate != 0) continue;
+
+                // --- STANDARD LOGIC BELOW ---
+
+                // We optimize by scanning only surface interaction points
                 for (int y = 63; y <= ABSOLUTE_MAX_HEIGHT; y++) {
                     BlockPos pos = cp.getWorldPosition().offset(x, y, z);
                     BlockState currentState = level.getBlockState(pos);
 
-                    // --- MODE A: RISING ---
-                    if (y <= localTargetY) {
+                    if (y <= data.targetY) {
+                        // Rising Logic
                         if (level.isEmptyBlock(pos) || canSurgeDestroy(level, pos)) {
-
                             BlockPos belowPos = pos.below();
                             BlockState below = level.getBlockState(belowPos);
                             boolean shouldFlood = false;
@@ -79,8 +114,7 @@ public class SurgeScheduler {
                             if (below.getFluidState().is(net.minecraft.tags.FluidTags.WATER) ||
                                     below.is(ModBlocks.SURGE_WATER.get())) {
                                 shouldFlood = true;
-                            }
-                            else if (below.isSolidRender(level, belowPos)) {
+                            } else if (below.isSolidRender(level, belowPos)) {
                                 if (hasWaterNeighbor(level, pos)) {
                                     shouldFlood = true;
                                 }
@@ -95,22 +129,17 @@ public class SurgeScheduler {
                                 if (z == 0) spreadNorth = true;
                                 if (z == 15) spreadSouth = true;
 
-                                break; // Visual Smoothing
+                                break; // Place 1 block per sweep
                             }
                         }
-                    }
-                    // --- MODE B: RECEDING ---
-                    else {
+                    } else {
+                        // Receding Logic
                         if (currentState.is(ModBlocks.SURGE_WATER.get())) {
                             level.setBlock(pos, Blocks.AIR.defaultBlockState(), 2);
-
-                            // FIX: WAKE UP NEIGHBORS WHEN DRYING TOO!
-                            // This ensures the "Recession" spreads inland.
                             if (x == 0) spreadWest = true;
                             if (x == 15) spreadEast = true;
                             if (z == 0) spreadNorth = true;
                             if (z == 15) spreadSouth = true;
-
                         } else if (currentState.isAir()) {
                             break;
                         }
@@ -125,7 +154,7 @@ public class SurgeScheduler {
         if (spreadSouth) activateChunk(cp.x, cp.z + 1);
     }
 
-    // --- Helpers (No changes below) ---
+    // --- Helpers (Same as before) ---
     private static boolean hasWaterNeighbor(ServerLevel level, BlockPos pos) {
         return isWaterOrSurge(level, pos.north()) || isWaterOrSurge(level, pos.south()) ||
                 isWaterOrSurge(level, pos.east()) || isWaterOrSurge(level, pos.west());
