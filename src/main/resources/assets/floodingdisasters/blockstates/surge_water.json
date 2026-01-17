@@ -1,0 +1,7 @@
+{
+  "variants": {
+    "": {
+      "model": "floodingdisasters:block/surge_water"
+    }
+  }
+}
