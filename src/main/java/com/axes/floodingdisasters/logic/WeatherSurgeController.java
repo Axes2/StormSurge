@@ -1,90 +1,59 @@
 package com.axes.floodingdisasters.logic;
 
 import com.axes.floodingdisasters.FloodingDisasters;
-import net.minecraft.network.chat.Component;
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.Level; // Import Level
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.tick.LevelTickEvent;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.List;
-import java.util.Map;
 
 @EventBusSubscriber(modid = FloodingDisasters.MODID, bus = EventBusSubscriber.Bus.GAME)
 public class WeatherSurgeController {
 
     private static boolean weatherModFound = true;
+    private static Method getWindMethod;
 
     @SubscribeEvent
     public static void onLevelTick(LevelTickEvent.Post event) {
-        // 1. Client Check
-        if (event.getLevel().isClientSide || !weatherModFound) return;
-
-        // 2. DIMENSION FIX: Only run this logic in the Overworld
-        if (event.getLevel().dimension() != Level.OVERWORLD) return;
-
-        ServerLevel level = (ServerLevel) event.getLevel();
-
-        // Run every 60 ticks (3 seconds)
-        if (level.getGameTime() % 60 != 0) return;
-
-        try {
-            updateSurgeTargetReflectively(level);
-        } catch (Exception e) {
-            FloodingDisasters.LOGGER.warn("ProtoManly Weather integration failed: " + e.getMessage());
-            e.printStackTrace();
-            weatherModFound = false;
+        if (weatherModFound && getWindMethod == null) {
+            try {
+                Class<?> windEngineClass = Class.forName("dev.protomanly.pmweather.weather.WindEngine");
+                getWindMethod = windEngineClass.getMethod("getWind", Vec3.class, Level.class, boolean.class, boolean.class, boolean.class, boolean.class);
+            } catch (Exception e) {
+                weatherModFound = false;
+            }
         }
     }
 
-    private static void updateSurgeTargetReflectively(ServerLevel level) throws Exception {
-        Class<?> gameBusClass = Class.forName("dev.protomanly.pmweather.event.GameBusEvents");
-        Field managersField = gameBusClass.getDeclaredField("MANAGERS");
-        Map<?, ?> managers = (Map<?, ?>) managersField.get(null);
+    public static int getSurgeLevelAt(BlockPos pos, ServerLevel level) {
+        if (!weatherModFound || getWindMethod == null) return 62;
 
-        Object weatherHandler = managers.get(level.dimension());
-        if (weatherHandler == null) return;
+        try {
+            // Check at High Altitude (Y=180) to avoid terrain drag
+            Vec3 weatherBalloonPos = new Vec3(pos.getX(), 180.0, pos.getZ());
+            Vec3 windVector = (Vec3) getWindMethod.invoke(null, weatherBalloonPos, level, false, false, false, true);
+            double windSpeed = windVector.length();
 
-        Method getStormsMethod = weatherHandler.getClass().getMethod("getStorms");
-        List<?> storms = (List<?>) getStormsMethod.invoke(weatherHandler);
+            // --- BALANCED MATH ---
+            // Goal: 250mph = +8 Blocks. Weak storms = 0 Blocks.
+            // Threshold: 60mph. Divisor: 24.
 
-        float maxWindSpeed = 0.0f;
+            if (windSpeed < 60.0) {
+                return 62;
+            } else {
+                double rise = (windSpeed - 60.0) / 24.0;
+                int target = 62 + (int) rise;
 
-        for (Object stormObj : storms) {
-            Class<?> stormClass = stormObj.getClass();
-
-            boolean visualOnly = stormClass.getField("visualOnly").getBoolean(stormObj);
-            int stormType = stormClass.getField("stormType").getInt(stormObj);
-            float windspeed = stormClass.getField("windspeed").getFloat(stormObj);
-
-            // Added Type 2 (Tornado/Cyclone variant) to the allowed list
-            if (!visualOnly && (stormType == 1 || stormType == 0 || stormType == 2)) {
-                if (windspeed > maxWindSpeed) {
-                    maxWindSpeed = windspeed;
-                }
+                // Hard Cap at 75 (Sea Level + 13) to prevent world-ending floods
+                return Math.min(target, 75);
             }
-        }
 
-        int targetY;
-        if (maxWindSpeed < 50.0f) {
-            targetY = 62;
-        } else {
-            float rise = (maxWindSpeed - 50.0f) / 7.0f;
-            targetY = 62 + (int) rise;
-        }
-
-        targetY = Math.min(targetY, 80);
-
-        // Update Global Target
-        if (SurgeScheduler.TARGET_SURGE_LEVEL != targetY) {
-            SurgeScheduler.TARGET_SURGE_LEVEL = targetY;
-            level.getServer().getPlayerList().broadcastSystemMessage(
-                    Component.literal("🌊 Surge Updating! Wind: " + (int)maxWindSpeed + "mph -> Flood Level: " + targetY),
-                    false
-            );
+        } catch (Exception e) {
+            return 62;
         }
     }
 }

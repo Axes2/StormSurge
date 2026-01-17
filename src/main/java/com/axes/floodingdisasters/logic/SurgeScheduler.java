@@ -21,35 +21,33 @@ import java.util.Map;
 @EventBusSubscriber(modid = FloodingDisasters.MODID, bus = EventBusSubscriber.Bus.GAME)
 public class SurgeScheduler {
 
-    public static int TARGET_SURGE_LEVEL = 62;
     private static final int ABSOLUTE_MAX_HEIGHT = 90;
-
-    // We cache "True" for chunks that need flooding.
     private static final Map<ChunkPos, Boolean> COASTAL_CACHE = new HashMap<>();
 
     @SubscribeEvent
     public static void onLevelTick(LevelTickEvent.Post event) {
         if (event.getLevel().isClientSide) return;
-
         ServerLevel level = (ServerLevel) event.getLevel();
-
-        // Run every 20 ticks (1 second)
-        if (level.getGameTime() % 20 != 0) return;
 
         Iterable<LevelChunk> loadedChunks = getLoadedChunksSafe(level);
 
         for (LevelChunk chunk : loadedChunks) {
             if (chunk == null) continue;
-
             ChunkPos cp = chunk.getPos();
 
-            // 1. Initial Check (Only runs once per chunk)
+            // PERFORMANCE & VISUALS:
+            // 1. Faster Rate: Modulo 20 (Every 1 second).
+            //    This minimizes the "lag time" between neighbor chunks updates, reducing the "square" look.
+            // 2. Noise Hash: (x * 31 + z * 17).
+            //    This randomizes the order so you don't see a "scanner line" moving across the map.
+            if ((level.getGameTime() + (cp.x * 31L + cp.z * 17L)) % 20 != 0) continue;
+
+            // Cache Logic
             if (!COASTAL_CACHE.containsKey(cp)) {
                 boolean isCoastal = CoastCache.isCoastalChunk(level, cp);
                 COASTAL_CACHE.put(cp, isCoastal);
             }
 
-            // 2. If Active, Run Surge
             if (COASTAL_CACHE.get(cp)) {
                 processChunkSurge(level, chunk);
             }
@@ -59,6 +57,9 @@ public class SurgeScheduler {
     private static void processChunkSurge(ServerLevel level, LevelChunk chunk) {
         ChunkPos cp = chunk.getPos();
 
+        BlockPos centerPos = cp.getWorldPosition().offset(8, 62, 8);
+        int localTargetY = WeatherSurgeController.getSurgeLevelAt(centerPos, level);
+
         boolean spreadNorth = false;
         boolean spreadSouth = false;
         boolean spreadWest = false;
@@ -67,55 +68,55 @@ public class SurgeScheduler {
         for (int x = 0; x < 16; x++) {
             for (int z = 0; z < 16; z++) {
 
-                // Scan from Sea Level up to Max
+                // COLUMN OPTIMIZATION:
+                // We don't check the whole stack. We act on the surface and stop.
                 for (int y = 63; y <= ABSOLUTE_MAX_HEIGHT; y++) {
                     BlockPos pos = cp.getWorldPosition().offset(x, y, z);
                     BlockState currentState = level.getBlockState(pos);
 
-                    // --- MODE A: RISING ---
-                    if (y <= TARGET_SURGE_LEVEL) {
-
-                        // 1. Valid Spot? (Air or Destroyable)
+                    // --- RISING ---
+                    if (y <= localTargetY) {
                         if (level.isEmptyBlock(pos) || canSurgeDestroy(level, pos)) {
 
                             BlockPos belowPos = pos.below();
                             BlockState below = level.getBlockState(belowPos);
-
                             boolean shouldFlood = false;
 
-                            // CONDITION 1: RISING (Vertical)
-                            // If the block below is already water, the water rises effortlessly.
                             if (below.getFluidState().is(net.minecraft.tags.FluidTags.WATER) ||
                                     below.is(ModBlocks.SURGE_WATER.get())) {
                                 shouldFlood = true;
                             }
-                            // CONDITION 2: SPREADING (Horizontal)
-                            // If the block below is Land, we only flood if a neighbor is water.
                             else if (below.isSolidRender(level, belowPos)) {
                                 if (hasWaterNeighbor(level, pos)) {
                                     shouldFlood = true;
                                 }
                             }
 
-                            // EXECUTE FLOOD
                             if (shouldFlood) {
-                                if (!level.isEmptyBlock(pos)) {
-                                    level.destroyBlock(pos, true);
-                                }
+                                if (!level.isEmptyBlock(pos)) level.destroyBlock(pos, true);
                                 level.setBlock(pos, ModBlocks.SURGE_WATER.get().defaultBlockState(), 2);
 
-                                // Flag borders to wake up neighbors
                                 if (x == 0) spreadWest = true;
                                 if (x == 15) spreadEast = true;
                                 if (z == 0) spreadNorth = true;
                                 if (z == 15) spreadSouth = true;
+
+                                // VISUAL SMOOTHING:
+                                // Break immediately after placing ONE block in this column.
+                                // This creates a "Slow Rise" effect (1 meter/sec) and saves huge CPU.
+                                break;
                             }
                         }
                     }
-                    // --- MODE B: RECEDING ---
+                    // --- RECEDING ---
                     else {
+                        // For receding, we still want to clear everything above instantly.
+                        // But we can optimize: if we hit air, we know the rest above is air (usually).
                         if (currentState.is(ModBlocks.SURGE_WATER.get())) {
                             level.setBlock(pos, Blocks.AIR.defaultBlockState(), 2);
+                        } else if (currentState.isAir()) {
+                            // Optimization: If we hit air, stop scanning up.
+                            break;
                         }
                     }
                 }
@@ -128,27 +129,19 @@ public class SurgeScheduler {
         if (spreadSouth) activateChunk(cp.x, cp.z + 1);
     }
 
-    // NEW HELPER: Checks if any horizontal neighbor is a water source
+    // --- Standard Helpers ---
     private static boolean hasWaterNeighbor(ServerLevel level, BlockPos pos) {
-        // Optimization: Check the most likely neighbors first? No, standard order is fine.
-        return isWaterOrSurge(level, pos.north()) ||
-                isWaterOrSurge(level, pos.south()) ||
-                isWaterOrSurge(level, pos.east()) ||
-                isWaterOrSurge(level, pos.west());
-        // Note: We do NOT check UP. Water doesn't flow down from the sky in a surge,
-        // it flows from the ocean sideways.
+        return isWaterOrSurge(level, pos.north()) || isWaterOrSurge(level, pos.south()) ||
+                isWaterOrSurge(level, pos.east()) || isWaterOrSurge(level, pos.west());
     }
 
     private static boolean isWaterOrSurge(ServerLevel level, BlockPos pos) {
-        // We use getBlockState because it handles chunk boundaries automatically.
         BlockState state = level.getBlockState(pos);
         return state.is(Blocks.WATER) || state.is(ModBlocks.SURGE_WATER.get());
     }
 
     private static void activateChunk(int chunkX, int chunkZ) {
         ChunkPos neighbor = new ChunkPos(chunkX, chunkZ);
-        // If it wasn't active before, mark it as active now.
-        // This effectively bypasses the CoastCache check for inland chunks.
         if (!Boolean.TRUE.equals(COASTAL_CACHE.get(neighbor))) {
             COASTAL_CACHE.put(neighbor, true);
         }
@@ -165,7 +158,6 @@ public class SurgeScheduler {
         );
     }
 
-    // (Keep the getLoadedChunksSafe method exactly the same as before)
     private static Iterable<LevelChunk> getLoadedChunksSafe(ServerLevel level) {
         try {
             ServerChunkCache chunkSource = level.getChunkSource();

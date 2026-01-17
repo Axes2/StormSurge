@@ -15,14 +15,11 @@ public class FloodingDisasters {
     public FloodingDisasters(IEventBus modEventBus) {
         // Register the Setup method for mod loading
         modEventBus.addListener(this::setup);
-        net.neoforged.neoforge.common.NeoForge.EVENT_BUS.addListener(this::onRegisterCommands);
+
 
         // Register Blocks and Items (We will create this class next)
         ModBlocks.BLOCKS.register(modEventBus);
         ModBlocks.ITEMS.register(modEventBus);
-    }
-    private void onRegisterCommands(RegisterCommandsEvent event) {
-        com.axes.floodingdisasters.commands.FloodCommand.register(event.getDispatcher());
     }
 
 
